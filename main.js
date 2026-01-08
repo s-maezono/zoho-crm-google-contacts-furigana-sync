@@ -1,161 +1,142 @@
-function doPost(e) {
-  let logBuffer = [];
-  const log = (msg) => {
-    logBuffer.push(new Date().toISOString() + " " + msg);
-  };
+/**
+ * Zoho CRM - Google Contacts Furigana Sync
+ * Final Production Version
+ * * 機能:
+ * 1. 同姓同名（複数ヒット）時は安全のため更新しない
+ * 2. 既存の漢字や、Zoho側から送られなかったふりがなは消さずに維持する
+ * 3. ログはシンプルにGAS標準コンソールに出力する
+ */
 
-  log("=== 処理開始 (Safe Mode v3.0) ===");
-  
+function doPost(e) {
+  console.log("=== 処理開始 ===");
+
   try {
-    // 1. 受信データの確認
+    // 1. データ受信チェック
     if (!e || !e.postData) {
-      log("エラー: データが受信できていません");
-      return sendLogAndReturn(logBuffer, "Error: No data");
+      console.error("エラー: データが受信できていません");
+      return ContentService.createTextOutput("Error: No data");
     }
-    
+
     const data = JSON.parse(e.postData.contents);
-    log("受信データ: " + JSON.stringify(data));
+    // 個人情報保護のため、ログには識別子程度を出力する運用も可だが、デバッグ中は出す
+    console.log(`受信データ: ${JSON.stringify(data)}`);
 
     let contactInfo = null;
     let searchType = "";
 
-    // 2. 検索実行（優先度順）
+    // 2. コンタクト検索（優先度: Email -> 携帯 -> 固定電話）
+    // ロジックはテスト成功時と同じものを維持
     if (data.email) {
       searchType = "email";
-      contactInfo = searchContactSafe(log, searchType, data.email);
+      contactInfo = searchContactSafe(data.email);
     }
 
     if (!contactInfo && data.phone_mobile) {
       searchType = "mobile";
-      contactInfo = searchContactSafe(log, searchType, data.phone_mobile);
+      contactInfo = searchContactSafe(data.phone_mobile);
     }
 
     if (!contactInfo && data.phone_fixed) {
       searchType = "fixed";
-      contactInfo = searchContactSafe(log, searchType, data.phone_fixed);
+      contactInfo = searchContactSafe(data.phone_fixed);
     }
 
     // 3. 更新処理
     if (contactInfo) {
-      log("対象コンタクト特定: " + contactInfo.resourceName + " (by " + searchType + ")");
+      console.log(`特定成功: ${contactInfo.resourceName} (by ${searchType})`);
       
-      updateContactKanaSafe(log, contactInfo, data.given_name_kana, data.family_name_kana);
+      updateContactName(contactInfo, data.given_name_kana, data.family_name_kana);
       
-      log("=== 処理完了 (成功) ===");
-      return sendLogAndReturn(logBuffer, "Success: Updated");
+      console.log("=== 処理完了 (成功) ===");
+      return ContentService.createTextOutput("Success: Updated");
     } else {
-      log("警告: コンタクトが見つからないか、検索結果が曖昧なためスキップしました");
-      return sendLogAndReturn(logBuffer, "Skipped: Not found or Ambiguous");
+      console.warn("スキップ: 対象が見つからないか、検索結果が曖昧です");
+      return ContentService.createTextOutput("Skipped");
     }
 
   } catch (err) {
-    log("致命的なエラー: " + err.toString());
-    log("Stack: " + err.stack);
-    // エラー時は必ずメール通知
-    sendErrorEmail(logBuffer.join("\n"));
-    return ContentService.createTextOutput("Error: " + err.toString());
+    console.error(`システムエラー: ${err.toString()}`);
+    return ContentService.createTextOutput(`Error: ${err.toString()}`);
   }
 }
 
-// ログ送信とレスポンス生成の補助関数
-function sendLogAndReturn(logBuffer, responseText) {
-  // 成功時も念のためログを送る（運用が安定したら「エラー時のみ」に切り替え推奨）
-  sendErrorEmail(logBuffer.join("\n"));
-  return ContentService.createTextOutput(responseText);
-}
-
-function sendErrorEmail(body) {
+/**
+ * 安全な検索実行
+ * 複数ヒット時は誤更新防止のため null を返す（安全装置）
+ */
+function searchContactSafe(query) {
   try {
-    const email = Session.getEffectiveUser().getEmail();
-    MailApp.sendEmail({
-      to: email,
-      subject: "GAS Zoho Sync Log",
-      body: body
-    });
-  } catch (e) {
-    console.error("メール送信失敗: " + e.toString());
-  }
-}
-
-// ① 改善案：結果が1件以外ならnullを返す安全な検索
-function searchContactSafe(log, type, query) {
-  try {
-    if (!query) return null;
-    log("検索実行: " + type + " = " + query);
-
     const response = People.People.searchContacts({
       query: query,
       readMask: 'names,emailAddresses,phoneNumbers'
     });
 
     if (!response.results || response.results.length === 0) {
-      log("→ 結果なし");
       return null;
     }
 
-    // ★最重要修正：1件のみヒットした場合だけ対象とする
+    // ★安全策: 複数件ヒットした場合は、別人書き換えリスクがあるため何もしない
     if (response.results.length > 1) {
-      log("⚠ 警告: " + response.results.length + " 件のコンタクトがヒットしたため、安全のため更新を中止します。");
+      console.warn(`警告: "${query}" で ${response.results.length} 件ヒットしました。安全のため処理を中断します。`);
       return null;
     }
 
     const person = response.results[0].person;
+    // Primaryフラグがある名前を優先、なければ配列の先頭
+    const primaryName = (person.names || []).find(n => n.metadata && n.metadata.primary) || (person.names || [])[0] || {};
+
     return {
       resourceName: person.resourceName,
       etag: person.etag,
-      names: person.names || []
+      names: person.names || [],
+      // ログ確認用に表示名も持たせておく
+      displayName: primaryName.displayName || '(No Name)'
     };
   } catch (e) {
-    log("検索エラー: " + e.toString());
+    console.error(`検索APIエラー: ${e.toString()}`);
+    return null;
   }
-  return null;
 }
 
-function updateContactKanaSafe(log, contactInfo, givenNameKana, familyNameKana) {
+/**
+ * 名前の更新処理
+ * 既存の値を維持しつつマージする（データ保護）
+ */
+function updateContactName(contactInfo, newGivenKana, newFamilyKana) {
   try {
-    // ② 改善案：Primary指定がある名前を優先取得、なければ先頭
     const existingName = contactInfo.names.find(n => n.metadata && n.metadata.primary) 
                          || contactInfo.names[0] 
                          || {};
 
-    log("既存の名前データ(Primary): " + JSON.stringify(existingName));
+    console.log(`既存データ: ${JSON.stringify(existingName)}`);
 
-    // ③ 改善案：入力がない場合は既存の値を維持（空文字上書き防止）
-    // InputがあるならInputを使う。Inputが空なら、既存のPhoneticを使う。それもなければ空文字。
-    const newPhoneticGiven = givenNameKana ? givenNameKana : (existingName.phoneticGivenName || '');
-    const newPhoneticFamily = familyNameKana ? familyNameKana : (existingName.phoneticFamilyName || '');
+    // マージロジック:
+    // 入力値がある -> それを使う
+    // 入力値がない -> 既存のフリガナを使う
+    // 既存もない -> 空文字
+    const phoneticGiven = newGivenKana ? newGivenKana : (existingName.phoneticGivenName || '');
+    const phoneticFamily = newFamilyKana ? newFamilyKana : (existingName.phoneticFamilyName || '');
 
     const namePayload = {
-      givenName: existingName.givenName || '',
-      familyName: existingName.familyName || '',
-      phoneticGivenName: newPhoneticGiven,
-      phoneticFamilyName: newPhoneticFamily
-    };
-    
-    log("更新ペイロード: " + JSON.stringify(namePayload));
-
-    // ④ etagを利用した楽観ロック更新
-    const contact = {
-      etag: contactInfo.etag,
-      names: [namePayload]
+      givenName: existingName.givenName || '',       // 漢字は既存を維持
+      familyName: existingName.familyName || '',     // 漢字は既存を維持
+      phoneticGivenName: phoneticGiven,
+      phoneticFamilyName: phoneticFamily
     };
 
-    // ⑤ updatePersonFields 指定（これは元からOK）
+    console.log(`更新ペイロード: ${JSON.stringify(namePayload)}`);
+
     People.People.updateContact(
-      contact,
+      {
+        etag: contactInfo.etag,
+        names: [namePayload]
+      },
       contactInfo.resourceName,
       { updatePersonFields: 'names' }
     );
-    
-    log("API更新リクエスト完了");
 
   } catch (e) {
-    log("更新処理中にエラー: " + e.toString());
+    console.error(`更新処理エラー: ${e.toString()}`);
     throw e;
   }
-}
-
-// ⑦ 権限認証用関数
-function setupAuth() {
-  console.log("メール送信権限の確認完了");
 }
